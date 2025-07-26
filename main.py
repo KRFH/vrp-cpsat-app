@@ -1,28 +1,31 @@
 """
-Minimal VRP with CP-SAT (OR-Tools) — 2 vehicles, 5 customers, 1 depot, with Soft Time Windows (Fixed)
----------------------------------------------------------------------
+Minimal VRP with CP-SAT (OR-Tools) — 2 vehicles, 5 customers, 1 depot, with Soft Time Windows & Workers
+------------------------------------------------------------------------------------------
 Requirements implemented:
  - Vehicle departs/returns from depot
  - Flow conservation per vehicle
  - Each customer visited exactly once
  - MTZ subtour elimination
- - Soft time windows (slack vars) and service times
+ - Soft time windows and service times
+ - Multiple workers assignment (y) and boarding (p)
 
-Note: Time propagation to the depot return arcs has been disabled to avoid infeasibility from cycle constraints.
+NOT implemented yet: capacities, skills
 """
 
 from ortools.sat.python import cp_model
 
 # ---------------------- Problem data ----------------------
-# Nodes: 0 is depot, 1..5 are customers
+# Nodes: 0 is depot, 1..5 customers
 NODES = [0, 1, 2, 3, 4, 5]
 DEPOT = 0
 CUSTOMERS = [1, 2, 3, 4, 5]
 
 # Vehicles
 VEHICLES = [0, 1]
+# Workers
+WORKERS = ["A", "B"]  # two workers
 
-# Distance matrix (travel times)
+# Travel times (distance)
 D = [
     [0, 10, 15, 20, 18, 25],
     [10, 0, 35, 25, 20, 28],
@@ -34,28 +37,19 @@ D = [
 # Service times
 service_time = {i: 5 for i in NODES}
 service_time[0] = 0
-
 # Time windows (earliest, latest)
-time_windows = {
-    0: (0, 200),
-    1: (10, 50),
-    2: (20, 60),
-    3: (15, 55),
-    4: (0, 40),
-    5: (30, 80),
-}
+time_windows = {0: (0, 200), 1: (10, 50), 2: (20, 60), 3: (15, 55), 4: (0, 40), 5: (30, 80)}
 max_window = max(b for (_, b) in time_windows.values())
 BIG_M = max_window + max(service_time.values())
-
 # MTZ rank max
 max_rank = len(CUSTOMERS)
-# Penalty weight for time violations
+# Penalty weight for time windows
 time_penalty = 100
 
 # ---------------------- Model ----------------------
 model = cp_model.CpModel()
 
-# Route decision variables
+# Decision: x[i,j,k] = vehicle k travels i->j
 x = {}
 for i in NODES:
     for j in NODES:
@@ -63,7 +57,7 @@ for i in NODES:
             continue
         for k in VEHICLES:
             x[i, j, k] = model.NewBoolVar(f"x_{i}_{j}_v{k}")
-# Aggregate arc usage for MTZ
+# Aggregate arc use for MTZ
 tot = {}
 for i in NODES:
     for j in NODES:
@@ -71,15 +65,29 @@ for i in NODES:
             continue
         tot[i, j] = model.NewBoolVar(f"x_tot_{i}_{j}")
         model.AddMaxEquality(tot[i, j], [x[i, j, k] for k in VEHICLES])
-# MTZ ordering
+# MTZ order vars for customers
 u = {i: model.NewIntVar(1, max_rank, f"u_{i}") for i in CUSTOMERS}
-# Time and slack vars
+# Time vars and slack
 t = {i: model.NewIntVar(0, BIG_M * 2, f"t_{i}") for i in NODES}
 e = {i: model.NewIntVar(0, BIG_M, f"e_{i}") for i in NODES}
 l = {i: model.NewIntVar(0, BIG_M, f"l_{i}") for i in NODES}
+# Worker assignment y[i,w] and boarding p[i,w,k]
+y = {}
+p = {}
+for i in CUSTOMERS:
+    for w in WORKERS:
+        y[i, w] = model.NewBoolVar(f"y_{i}_{w}")
+        for k in VEHICLES:
+            p[i, w, k] = model.NewBoolVar(f"p_{i}_{w}_v{k}")
+# Node-vehicle visit z[i,k]
+z = {}
+for i in NODES:
+    for k in VEHICLES:
+        z[i, k] = model.NewBoolVar(f"z_{i}_v{k}")
+        model.AddMaxEquality(z[i, k], [x[j, i, k] for j in NODES if j != i])
 
 # ---------------------- Constraints ----------------------
-# 1) Depot depart/return per vehicle
+# 1) Depot depart/return
 for k in VEHICLES:
     model.Add(sum(x[DEPOT, j, k] for j in NODES if j != DEPOT) == 1)
     model.Add(sum(x[i, DEPOT, k] for i in NODES if i != DEPOT) == 1)
@@ -87,7 +95,7 @@ for k in VEHICLES:
 for k in VEHICLES:
     for i in CUSTOMERS:
         model.Add(sum(x[j, i, k] for j in NODES if j != i) == sum(x[i, j, k] for j in NODES if j != i))
-# 3) Each customer visited exactly once
+# 3) Each customer visited once
 for i in CUSTOMERS:
     model.Add(sum(x[j, i, k] for j in NODES if j != i for k in VEHICLES) == 1)
 # 4) MTZ subtour elimination
@@ -97,22 +105,31 @@ for i in CUSTOMERS:
             model.Add(u[i] - u[j] + max_rank * tot[i, j] <= max_rank - 1)
 
 
-# 5) Soft time windows at nodes
-def add_time_window(i):
+# 5) Soft time windows
+def add_tw(i):
     a, b = time_windows[i]
     model.Add(t[i] + e[i] >= a)
     model.Add(t[i] - l[i] <= b)
 
 
 for i in NODES:
-    add_time_window(i)
-# 6) Time propagation on used arcs (exclude return to depot)
+    add_tw(i)
+# 6) Time propagation (no return to depot)
 for k in VEHICLES:
     for i in NODES:
         for j in NODES:
             if i == j or j == DEPOT:
                 continue
             model.Add(t[j] >= t[i] + service_time[i] + D[i][j] - BIG_M * (1 - x[i, j, k]))
+# 7) Worker assignment: each customer exactly one worker
+for i in CUSTOMERS:
+    model.Add(sum(y[i, w] for w in WORKERS) >= 1)
+# 8) Boarding consistency: if assigned then board exactly one vehicle
+for i in CUSTOMERS:
+    for w in WORKERS:
+        model.Add(sum(p[i, w, k] for k in VEHICLES) == y[i, w])
+        for k in VEHICLES:
+            model.Add(p[i, w, k] <= z[i, k])
 
 # ---------------------- Objective ----------------------
 dist_cost = sum(D[i][j] * x[i, j, k] for i in NODES for j in NODES if i != j for k in VEHICLES)
@@ -128,21 +145,25 @@ status = solver.Solve(model)
 # ---------------------- Output ----------------------
 if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
     print(f"Status: {solver.StatusName(status)}")
-    print(f"Obj (dist + time penalties): {solver.ObjectiveValue()}\n")
+    print(f"Obj: {solver.ObjectiveValue()}\n")
     for k in VEHICLES:
         route = [DEPOT]
         cur = DEPOT
         while True:
-            nxts = [j for j in NODES if j != cur and solver.Value(x[cur, j, k])]
-            if not nxts:
+            nxt = [j for j in NODES if j != cur and solver.Value(x[cur, j, k])]
+            if not nxt:
                 break
-            cur = nxts[0]
+            cur = nxt[0]
             route.append(cur)
             if cur == DEPOT:
                 break
-        print(f"Vehicle {k} route: {route}")
-    print("\nTime arrival & slacks:")
-    for i in NODES:
-        print(f" Node {i}: t={solver.Value(t[i])}, e={solver.Value(e[i])}, l={solver.Value(l[i])}")
+        print(f"Vehicle {k}: {route}")
+    print("\nAssignments and boarding:")
+    for i in CUSTOMERS:
+        for w in WORKERS:
+            if solver.Value(y[i, w]):
+                for k in VEHICLES:
+                    if solver.Value(p[i, w, k]):
+                        print(f"Customer {i} -> worker {w} on vehicle {k}")
 else:
     print("No feasible solution found.")
